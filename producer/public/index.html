@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order Service</title>
+  <style>
+    :root {
+      --bg: #f6f7f9; --card: #ffffff; --text: #1d232b; --muted: #66707c; --border: #e1e4e8;
+      --accent: #188fff; --accent-ink: #ffffff; --ok: #1a7f37; --err: #cf222e; --code-bg: #eef1f4;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1216; --card: #171b21; --text: #e6e9ed; --muted: #8b949e; --border: #2a3038;
+        --accent: #3d9dff; --accent-ink: #0f1216; --ok: #3fb950; --err: #f85149; --code-bg: #20262e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    main { max-width: 860px; margin: 0 auto; padding: 32px 16px 48px; }
+    header { margin-bottom: 24px; }
+    h1 { margin: 0 0 4px; font-size: 26px; }
+    header p { margin: 0; color: var(--muted); }
+    code { font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; background: var(--code-bg); padding: 1px 6px; border-radius: 4px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+    .card h2 { margin: 0 0 14px; font-size: 16px; }
+    form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+    input, select {
+      font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; min-width: 0;
+    }
+    select { min-width: 180px; }
+    input[type=number] { width: 100px; }
+    button {
+      font: inherit; font-weight: 600; border: 0; border-radius: 6px; padding: 9px 16px; cursor: pointer;
+      background: var(--accent); color: var(--accent-ink);
+    }
+    button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+    button:disabled { opacity: .6; cursor: wait; }
+    .actions { display: flex; gap: 12px; flex-wrap: wrap; }
+    #status { margin-top: 14px; min-height: 22px; font-size: 14px; }
+    #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    td.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
+    .empty { color: var(--muted); padding: 16px 10px; }
+    .flow { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>📦 Order Service</h1>
+    <p>Producer · publishes <code>OrderCreated</code> events to topic <code>persistent://public/default/orders</code></p>
+  </header>
+
+  <section class="card">
+    <h2>Create an order</h2>
+    <form id="order-form">
+      <label>Product
+        <select name="product">
+          <option>Laptop</option><option>Keyboard</option><option>Mouse</option>
+          <option>Monitor</option><option>Headphones</option><option>Webcam</option><option>USB-C Hub</option>
+        </select>
+      </label>
+      <label>Quantity
+        <input name="quantity" type="number" min="1" value="1" required>
+      </label>
+      <div class="actions">
+        <button type="submit">Send order</button>
+        <button type="button" class="secondary" id="random-btn">Send 10 random orders</button>
+      </div>
+    </form>
+    <div id="status" role="status"></div>
+    <div class="flow">Browser → <b>order-service</b> → Pulsar topic <b>orders</b> → subscriptions <b>inventory</b> (Shared) &amp; <b>notifications</b> (Exclusive)</div>
+  </section>
+
+  <section class="card">
+    <h2>Published events</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Order ID</th><th>Product</th><th>Qty</th><th>Pulsar message ID</th></tr></thead>
+        <tbody id="sent"><tr><td colspan="5" class="empty">No events published yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  const form = document.getElementById('order-form');
+  const randomBtn = document.getElementById('random-btn');
+  const statusEl = document.getElementById('status');
+  const tbody = document.getElementById('sent');
+
+  function setStatus(text, kind) {
+    statusEl.textContent = text;
+    statusEl.className = kind || '';
+  }
+
+  function addRows(results) {
+    if (tbody.querySelector('.empty')) tbody.innerHTML = '';
+    for (const r of results) {
+      const tr = document.createElement('tr');
+      const cells = [
+        new Date(r.event.createdAt).toLocaleTimeString(),
+        r.orderId.slice(0, 8),
+        r.event.product,
+        r.event.quantity,
+        r.messageId,
+      ];
+      cells.forEach((value, i) => {
+        const td = document.createElement('td');
+        td.textContent = value;
+        if (i === 1 || i === 4) td.className = 'mono';
+        tr.appendChild(td);
+      });
+      tbody.prepend(tr);
+    }
+  }
+
+  async function post(url, body) {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    return data;
+  }
+
+  async function run(button, action) {
+    button.disabled = true;
+    try { await action(); } catch (err) { setStatus('✖ ' + err.message, 'err'); }
+    finally { button.disabled = false; }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    run(form.querySelector('button[type=submit]'), async () => {
+      const result = await post('/orders', { product: fd.get('product'), quantity: Number(fd.get('quantity')) });
+      addRows([result]);
+      setStatus(`✔ Published order ${result.orderId.slice(0, 8)} (msgId ${result.messageId})`, 'ok');
+    });
+  });
+
+  randomBtn.addEventListener('click', () => run(randomBtn, async () => {
+    const { sent } = await post('/orders/random?count=10');
+    addRows(sent);
+    setStatus(`✔ Published ${sent.length} random orders`, 'ok');
+  }));
+</script>
+</body>
+</html>

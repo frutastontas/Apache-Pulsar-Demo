@@ -1,0 +1,118 @@
+name: pulsar-demo
+
+# Shared settings for the three consumer containers (same image, different env).
+x-consumer: &consumer
+  build:
+    context: ./consumer
+    secrets: [extra_ca]
+  restart: unless-stopped
+  depends_on:
+    pulsar:
+      condition: service_healthy
+  environment: &consumer-env
+    PULSAR_URL: pulsar://pulsar:6650
+    TOPIC: persistent://public/default/orders
+
+services:
+  # ---------------------------------------------------------------------------
+  # The message broker. "standalone" runs broker + BookKeeper (storage) +
+  # metadata store in a single process: same APIs as a real cluster.
+  # ---------------------------------------------------------------------------
+  pulsar:
+    image: apachepulsar/pulsar:4.0.14
+    hostname: pulsar # the broker advertises this name to clients during topic lookup
+    command: bin/pulsar standalone --no-functions-worker --no-stream-storage
+    environment:
+      PULSAR_MEM: -Xms512m -Xmx512m -XX:MaxDirectMemorySize=512m
+    ports:
+      - "6650:6650" # binary protocol (producers / consumers)
+      - "8080:8080" # admin REST API (pulsar-admin, Pulsar Express)
+    volumes:
+      - pulsar-data:/pulsar/data
+    healthcheck:
+      test: ["CMD", "bin/pulsar-admin", "brokers", "healthcheck"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Web GUI to inspect the cluster: http://localhost:3001
+  # ---------------------------------------------------------------------------
+  pulsar-express:
+    image: bbonnin/pulsar-express:latest
+    ports:
+      - "3001:3000" # host 3001 -> container 3000 (3000 is often taken by other dev servers)
+    environment:
+      PE_CONNECTION_URL: http://pulsar:8080
+      PE_CONNECTION_NAME: pulsar-demo
+    depends_on:
+      pulsar:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # PRODUCER: Express app that publishes OrderCreated events.
+  # http://localhost:4000
+  # ---------------------------------------------------------------------------
+  order-service:
+    build:
+      context: ./producer
+      secrets: [extra_ca]
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      PULSAR_URL: pulsar://pulsar:6650
+      TOPIC: persistent://public/default/orders
+    depends_on:
+      pulsar:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # CONSUMERS
+  # Subscription "inventory" (Shared): two instances split the orders.
+  # Subscription "notifications" (Exclusive): one instance gets every order.
+  # Subscription "billing" (Exclusive): another independent copy (fan-out).
+  # ---------------------------------------------------------------------------
+  inventory-service-1:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: inventory-service-1
+      SUBSCRIPTION: inventory
+      SUBSCRIPTION_TYPE: Shared
+
+  inventory-service-2:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: inventory-service-2
+      SUBSCRIPTION: inventory
+      SUBSCRIPTION_TYPE: Shared
+
+  notification-service:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: notification-service
+      SUBSCRIPTION: notifications
+      SUBSCRIPTION_TYPE: Exclusive
+
+  billing-service:
+    <<: *consumer
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: billing-service
+      SUBSCRIPTION: billing
+      SUBSCRIPTION_TYPE: Exclusive
+
+volumes:
+  pulsar-data:
+
+# Build-time only: an extra root CA for `npm ci`, needed when antivirus/proxy
+# software intercepts HTTPS (e.g. Avast sets NODE_EXTRA_CA_CERTS on Windows).
+# Falls back to an empty file when the variable is not set.
+secrets:
+  extra_ca:
+    file: ${NODE_EXTRA_CA_CERTS:-./docker/no-extra-ca.pem}

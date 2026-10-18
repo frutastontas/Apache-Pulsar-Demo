@@ -1,0 +1,13 @@
+{
+  "name": "order-consumer",
+  "version": "1.0.0",
+  "description": "Consumer: subscribes to OrderCreated events from Apache Pulsar",
+  "main": "consumer.js",
+  "private": true,
+  "scripts": {
+    "start": "node consumer.js"
+  },
+  "dependencies": {
+    "pulsar-client": "^1.18.0"
+  }
+}
