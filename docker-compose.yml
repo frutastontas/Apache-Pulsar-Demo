@@ -64,6 +64,8 @@ services:
     environment:
       PORT: 4000
       PULSAR_URL: pulsar://pulsar:6650
+      PULSAR_ADMIN_URL: http://pulsar:8080 # live stats + replay (cursor reset)
+      TRAFFIC_RATE: 10 # orders/s from the "Start traffic" button
       TOPIC: persistent://public/default/orders
     depends_on:
       pulsar:

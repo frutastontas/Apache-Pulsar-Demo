@@ -51,6 +51,31 @@
     td.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 13px; }
     .empty { color: var(--muted); padding: 16px 10px; }
     .flow { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+    /* Simulate load */
+    .controls { display: flex; flex-wrap: wrap; gap: 24px; }
+    .control { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+    .control .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .hint { font-size: 13px; color: var(--muted); }
+    button.stop { background: var(--err); color: #fff; }
+    .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--err); margin-right: 6px; animation: pulse 1s infinite; }
+    @keyframes pulse { 50% { opacity: .3; } }
+
+    /* Live stats */
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .tile { border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; }
+    .tile .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .tile .value { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tile .unit { font-size: 13px; color: var(--muted); font-weight: 400; }
+    .subs { display: flex; flex-direction: column; gap: 14px; }
+    .sub-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; justify-content: space-between; font-size: 14px; }
+    .sub-name { font-weight: 600; }
+    .badge { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); margin-left: 6px; }
+    .sub-meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+    .bar { height: 12px; background: var(--code-bg); border-radius: 6px; overflow: hidden; margin-top: 6px; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); border-radius: 6px; transition: width .6s ease, background-color .6s; }
+    .bar > div.high { background: #e3a008; }
+    .stats-error { color: var(--err); font-size: 14px; }
   </style>
 </head>
 <body>
@@ -82,7 +107,39 @@
   </section>
 
   <section class="card">
-    <h2>Published events</h2>
+    <h2>Simulate load</h2>
+    <div class="controls">
+      <div class="control">
+        <div class="row">
+          <button type="button" id="traffic-btn">▶ Start traffic</button>
+          <span class="hint" id="traffic-info">Publishes orders continuously until stopped</span>
+        </div>
+      </div>
+      <div class="control">
+        <div class="row">
+          <label>Subscription <select id="replay-sub"><option>billing</option></select></label>
+          <label>Rewind <select id="replay-min">
+            <option value="1">1 minute</option><option value="5">5 minutes</option><option value="15">15 minutes</option>
+          </select></label>
+          <button type="button" class="secondary" id="replay-btn">⏪ Replay</button>
+        </div>
+        <span class="hint" id="replay-info">Re-delivers past events to one subscription only</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Live topic stats <span class="hint">· refreshed every second from the Pulsar admin API</span></h2>
+    <div class="tiles">
+      <div class="tile"><div class="label">Published</div><div class="value"><span id="t-in">0</span> <span class="unit">msg/s</span></div></div>
+      <div class="tile"><div class="label">Delivered</div><div class="value"><span id="t-out">0</span> <span class="unit">msg/s</span></div></div>
+      <div class="tile"><div class="label">Total published</div><div class="value" id="t-total">0</div></div>
+    </div>
+    <div class="subs" id="subs"></div>
+  </section>
+
+  <section class="card">
+    <h2>Published events <span class="hint">· orders sent from this form</span></h2>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Time</th><th>Order ID</th><th>Product</th><th>Qty</th><th>Pulsar message ID</th></tr></thead>
@@ -122,6 +179,7 @@
       });
       tbody.prepend(tr);
     }
+    while (tbody.rows.length > 50) tbody.deleteRow(-1);
   }
 
   async function post(url, body) {
@@ -156,6 +214,104 @@
     addRows(sent);
     setStatus(`✔ Published ${sent.length} random orders`, 'ok');
   }));
+
+  // --- Simulate load -------------------------------------------------------
+  const trafficBtn = document.getElementById('traffic-btn');
+  const trafficInfo = document.getElementById('traffic-info');
+  const replaySub = document.getElementById('replay-sub');
+  const replayMin = document.getElementById('replay-min');
+  const replayBtn = document.getElementById('replay-btn');
+  const replayInfo = document.getElementById('replay-info');
+  let trafficRunning = false;
+
+  function renderTraffic(t) {
+    trafficRunning = t.running;
+    trafficBtn.textContent = t.running ? '■ Stop traffic' : '▶ Start traffic';
+    trafficBtn.className = t.running ? 'stop' : '';
+    if (t.running) trafficInfo.innerHTML = `<span class="live-dot"></span>Publishing ${t.rate} orders/s · ${t.sent} sent`;
+    else if (t.sent) trafficInfo.textContent = `Stopped · ${t.sent} orders sent`;
+  }
+
+  trafficBtn.addEventListener('click', () => run(trafficBtn, async () => {
+    renderTraffic(await post('/api/traffic', { action: trafficRunning ? 'stop' : 'start' }));
+  }));
+
+  replayBtn.addEventListener('click', () => run(replayBtn, async () => {
+    try {
+      const r = await post('/api/replay', { subscription: replaySub.value, minutes: Number(replayMin.value) });
+      replayInfo.textContent = r.replaying > 0
+        ? `⏪ "${r.subscription}" rewound to ${new Date(r.from).toLocaleTimeString()}: ${r.replaying} events will be re-delivered`
+        : `⏪ "${r.subscription}" rewound, but no events were published in the last ${r.minutes} min. Try a longer rewind`;
+      replayInfo.style.color = '';
+    } catch (err) {
+      replayInfo.textContent = '✖ ' + err.message;
+      replayInfo.style.color = 'var(--err)';
+    }
+  }));
+
+  // --- Live topic stats ----------------------------------------------------
+  const subsEl = document.getElementById('subs');
+  const fmt = (n) => Math.round(n).toLocaleString();
+
+  const subRows = new Map(); // reuse rows so the bar widths animate smoothly
+
+  function renderSubs(subs) {
+    const scale = Math.max(50, ...subs.map((s) => s.backlog)); // bars share one scale
+    if (subsEl.querySelector('.stats-error')) subsEl.innerHTML = '';
+    for (const s of subs.slice().sort((a, b) => a.name.localeCompare(b.name))) {
+      let row = subRows.get(s.name);
+      if (!row) {
+        row = document.createElement('div');
+        row.innerHTML = `
+          <div class="sub-head">
+            <span><span class="sub-name"></span><span class="badge"></span></span>
+            <span class="sub-meta"></span>
+          </div>
+          <div class="bar"><div></div></div>`;
+        row.querySelector('.sub-name').textContent = s.name;
+        subRows.set(s.name, row);
+      }
+      row.querySelector('.badge').textContent = s.type;
+      row.querySelector('.sub-meta').textContent =
+        `${s.consumers} consumer${s.consumers === 1 ? '' : 's'} · ${fmt(s.deliveredPerSec)} msg/s out · backlog ${fmt(s.backlog)}`;
+      const fill = row.querySelector('.bar > div');
+      fill.style.width = `${(s.backlog / scale) * 100}%`;
+      fill.classList.toggle('high', s.backlog > 20);
+      subsEl.appendChild(row);
+    }
+  }
+
+  function renderReplayOptions(subs) {
+    const names = subs.map((s) => s.name).sort();
+    const current = [...replaySub.options].map((o) => o.value);
+    if (names.join() === current.join()) return;
+    const selected = replaySub.value || 'billing';
+    replaySub.innerHTML = '';
+    for (const n of names) replaySub.add(new Option(n, n, false, n === selected));
+  }
+
+  async function refreshStats() {
+    try {
+      const res = await fetch('/api/stats');
+      const s = await res.json();
+      renderTraffic(s.traffic);
+      if (s.error) throw new Error(s.error);
+      document.getElementById('t-in').textContent = fmt(s.publishedPerSec);
+      document.getElementById('t-out').textContent = fmt(s.subscriptions.reduce((a, x) => a + x.deliveredPerSec, 0));
+      document.getElementById('t-total').textContent = fmt(s.published);
+      renderSubs(s.subscriptions);
+      renderReplayOptions(s.subscriptions);
+    } catch (err) {
+      subsEl.innerHTML = '';
+      subRows.clear();
+      const p = document.createElement('p');
+      p.className = 'stats-error';
+      p.textContent = '✖ Stats unavailable: ' + err.message;
+      subsEl.appendChild(p);
+    }
+  }
+  refreshStats();
+  setInterval(refreshStats, 1000);
 </script>
 </body>
 </html>

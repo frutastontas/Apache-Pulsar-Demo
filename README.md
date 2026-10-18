@@ -27,6 +27,8 @@ With direct calls, the order service would need to know about the inventory, not
 | **Fan-out** | Each subscription (`inventory`, `notifications`, `billing`) gets its **own copy of every event**. |
 | **Load balancing / scaling** | The two inventory instances share a **Shared** subscription, so Pulsar splits the orders between them. |
 | **Durability / resilience** | Stop a consumer and its events wait in the **backlog**. When it restarts, it receives every one. |
+| **Buffering under load** | **Start traffic**: the producer keeps publishing 10 orders/s even though consumers handle only ~3/s each. Pulsar absorbs the difference as backlog, and it drains when traffic stops. |
+| **Replay** | **⏪ Replay** rewinds one subscription in time, and only that service re-processes past events. With a classic queue, those messages would already be gone. |
 
 ## Pulsar concepts in 1 minute
 
@@ -76,6 +78,18 @@ Stop everything with `docker compose down`. To also delete the stored messages, 
 | 6 | Topic stats (Pulsar Express topic page, or the command below) | 3 subscriptions, all with `msgBacklog: 0`, and `inventory` showing 2 consumers |
 | 7 | `docker compose stop notification-service`, then send 5 orders | Stats: `notifications` **backlog = 5**, with no consumers, while inventory and billing still process everything |
 | 8 | `docker compose start notification-service` | Logs: it immediately receives the **5 missed orders, in order**, and the backlog goes back to 0 (**durability**) |
+| 9 | Click **▶ Start traffic**, wait ~15 s | **Live topic stats**: Published 10 msg/s, while the backlog bars grow. `inventory` (2 consumers, ~6 msg/s out) grows half as fast as `billing`/`notifications` (1 consumer, ~3 msg/s) (**buffering + scaling**) |
+| 10 | Click **■ Stop traffic** | Backlog bars drain to 0: `inventory` in ~5 s, the others in ~30 s. Nothing is lost |
+| 11 | Pick `billing` + 1 minute, click **⏪ Replay** | The page says *"N events will be re-delivered"*. Only `billing`'s bar jumps up and drains, while the other subscriptions stay at 0 (**replay**) |
+
+### Short version (~5 minutes)
+
+1. **Explain the architecture** using the diagram above. *(30 s)*
+2. **Fan-out and load balancing:** send one order, then 10, and point at the logs. *(1 min)*
+3. **Buffering:** Start traffic, watch the bars grow, then Stop and watch them drain. *(1 min)*
+4. **Durability:** stop `notification-service`, send orders, then start it again. *(1 min)*
+5. **Replay:** rewind `billing` 1 minute. *(30 s)*
+6. **Pulsar Express:** show the topic and its subscriptions. *(30 s)*
 
 Topic stats from the command line:
 
@@ -89,6 +103,9 @@ Send orders without the browser:
 ```bash
 curl -X POST localhost:4000/orders -H "content-type: application/json" -d '{"product":"Laptop","quantity":2}'
 curl -X POST "localhost:4000/orders/random?count=10"
+curl -X POST localhost:4000/api/traffic -H "content-type: application/json" -d '{"action":"start"}'   # or "stop"
+curl -X POST localhost:4000/api/replay  -H "content-type: application/json" -d '{"subscription":"billing","minutes":1}'
+curl localhost:4000/api/stats            # what the live panel shows
 ```
 
 ### Things to try

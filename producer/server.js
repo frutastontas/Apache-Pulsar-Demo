@@ -8,7 +8,11 @@ const Pulsar = require('pulsar-client');
 
 const PORT = Number(process.env.PORT || 4000);
 const PULSAR_URL = process.env.PULSAR_URL || 'pulsar://localhost:6650';
+const PULSAR_ADMIN_URL = process.env.PULSAR_ADMIN_URL || 'http://localhost:8080';
 const TOPIC = process.env.TOPIC || 'persistent://public/default/orders';
+const TRAFFIC_RATE = Number(process.env.TRAFFIC_RATE || 10); // orders per second while traffic is on
+// Admin REST path for the topic: persistent://public/default/orders -> persistent/public/default/orders
+const TOPIC_ADMIN_PATH = `${PULSAR_ADMIN_URL}/admin/v2/${TOPIC.replace('://', '/')}`;
 
 const PRODUCTS = ['Laptop', 'Keyboard', 'Mouse', 'Monitor', 'Headphones', 'Webcam', 'USB-C Hub'];
 
@@ -56,6 +60,72 @@ async function publishOrder(product, quantity) {
   return { orderId: event.orderId, messageId: msgId, event };
 }
 
+function publishRandomOrder() {
+  const product = PRODUCTS[Math.floor(Math.random() * PRODUCTS.length)];
+  return publishOrder(product, 1 + Math.floor(Math.random() * 5));
+}
+
+// --- Traffic generator: publishes TRAFFIC_RATE orders/s until stopped -------
+const traffic = { running: false, sent: 0, timer: null };
+
+function startTraffic() {
+  if (traffic.running) return;
+  traffic.running = true;
+  traffic.sent = 0;
+  log(`${c.yellow}🚦 Traffic ON${c.reset} (${TRAFFIC_RATE} orders/s)`);
+  traffic.timer = setInterval(() => {
+    publishRandomOrder()
+      .then(() => { traffic.sent++; })
+      .catch((err) => log(`${c.red}✖ Failed to publish:${c.reset} ${err.message}`));
+  }, 1000 / TRAFFIC_RATE);
+}
+
+function stopTraffic() {
+  if (!traffic.running) return;
+  clearInterval(traffic.timer);
+  traffic.running = false;
+  log(`${c.yellow}🚦 Traffic OFF${c.reset} after ${traffic.sent} orders`);
+}
+
+// --- Live stats: poll the Pulsar admin API every second ----------------------
+// Pulsar's own msgRateIn/Out are only refreshed periodically, so rates are
+// computed here from the (real-time) counters between two polls.
+let stats = { error: 'not polled yet' };
+let previous = null;
+
+async function pollStats() {
+  try {
+    const res = await fetch(`${TOPIC_ADMIN_PATH}/stats`);
+    if (!res.ok) throw new Error(`Pulsar admin API returned HTTP ${res.status}`);
+    const s = await res.json();
+    const now = Date.now();
+    const seconds = previous ? (now - previous.at) / 1000 : 0;
+    const perSec = (current, before) =>
+      seconds > 0 && before !== undefined ? Math.max(0, (current - before) / seconds) : 0;
+
+    const subscriptions = Object.entries(s.subscriptions).map(([name, sub]) => ({
+      name,
+      type: sub.type,
+      consumers: sub.consumers.length,
+      backlog: sub.msgBacklog,
+      deliveredPerSec: perSec(sub.msgOutCounter, previous?.delivered[name]),
+    }));
+    stats = {
+      published: s.msgInCounter,
+      publishedPerSec: perSec(s.msgInCounter, previous?.published),
+      subscriptions,
+    };
+    previous = {
+      at: now,
+      published: s.msgInCounter,
+      delivered: Object.fromEntries(Object.entries(s.subscriptions).map(([name, sub]) => [name, sub.msgOutCounter])),
+    };
+  } catch (err) {
+    stats = { error: err.message };
+    previous = null;
+  }
+}
+
 function validate(body) {
   const product = typeof body?.product === 'string' ? body.product.trim() : '';
   const quantity = Number(body?.quantity);
@@ -83,10 +153,7 @@ app.post('/orders/random', async (req, res) => {
   const count = Math.min(Math.max(Number(req.query.count) || 10, 1), 100);
   const sent = [];
   try {
-    for (let i = 0; i < count; i++) {
-      const product = PRODUCTS[Math.floor(Math.random() * PRODUCTS.length)];
-      sent.push(await publishOrder(product, 1 + Math.floor(Math.random() * 5)));
-    }
+    for (let i = 0; i < count; i++) sent.push(await publishRandomOrder());
     res.status(201).json({ sent });
   } catch (err) {
     log(`${c.red}✖ Failed to publish:${c.reset} ${err.message}`);
@@ -94,10 +161,54 @@ app.post('/orders/random', async (req, res) => {
   }
 });
 
+app.post('/api/traffic', (req, res) => {
+  const action = req.body?.action;
+  if (action === 'start') startTraffic();
+  else if (action === 'stop') stopTraffic();
+  else return res.status(400).json({ error: 'action must be "start" or "stop"' });
+  res.json({ running: traffic.running, sent: traffic.sent, rate: TRAFFIC_RATE });
+});
+
+app.get('/api/stats', (req, res) => {
+  res.json({ ...stats, traffic: { running: traffic.running, sent: traffic.sent, rate: TRAFFIC_RATE } });
+});
+
+// Rewind a subscription's cursor in time: its consumers re-receive those messages.
+app.post('/api/replay', async (req, res) => {
+  const subscription = String(req.body?.subscription || '');
+  const minutes = Number(req.body?.minutes);
+  if (!stats.subscriptions?.some((s) => s.name === subscription)) {
+    return res.status(400).json({ error: `unknown subscription "${subscription}"` });
+  }
+  if (!Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+    return res.status(400).json({ error: 'minutes must be an integer between 1 and 60' });
+  }
+  const timestamp = Date.now() - minutes * 60_000;
+  try {
+    const r = await fetch(
+      `${TOPIC_ADMIN_PATH}/subscription/${encodeURIComponent(subscription)}/resetcursor/${timestamp}`,
+      { method: 'POST' },
+    );
+    if (!r.ok) throw new Error(`Pulsar admin API returned HTTP ${r.status}: ${await r.text()}`);
+    // The subscription's backlog right after the reset = events that will be re-delivered.
+    const s = await (await fetch(`${TOPIC_ADMIN_PATH}/stats`)).json();
+    const replaying = s.subscriptions[subscription]?.msgBacklog ?? 0;
+    log(`${c.yellow}⏪ REPLAY${c.reset} subscription ${c.bold}${subscription}${c.reset} rewound ${minutes} min ` +
+        `(to ${new Date(timestamp).toISOString()}): ${replaying} events to re-deliver`);
+    res.json({ subscription, minutes, from: new Date(timestamp).toISOString(), replaying });
+  } catch (err) {
+    log(`${c.red}✖ Replay failed:${c.reset} ${err.message}`);
+    res.status(502).json({ error: `Replay failed: ${err.message}` });
+  }
+});
+
 let server;
+let statsTimer;
 
 async function shutdown() {
   log('Shutting down order-service...');
+  stopTraffic();
+  clearInterval(statsTimer);
   server?.close();
   await producer?.close().catch(() => {});
   await client?.close().catch(() => {});
@@ -108,6 +219,7 @@ process.on('SIGTERM', shutdown);
 
 connect()
   .then(() => {
+    statsTimer = setInterval(pollStats, 1000);
     server = app.listen(PORT, () => log(`${c.green}✔ order-service listening${c.reset} on http://localhost:${PORT}`));
   })
   .catch((err) => {
